@@ -1,0 +1,165 @@
+name: diagnosis-env
+version: "1.0.0"
+language: python
+description: >
+  DiagnosisEnv is an OpenEnv-compliant reinforcement learning environment for
+  AI-assisted medical diagnosis. The agent acts as a doctor: it gathers patient
+  symptoms, orders diagnostic tests, and makes a final diagnosis — all under
+  real-world constraints of time, cost, and patient trust.
+  The environment models 8 real infectious diseases common in India
+  (Dengue, Typhoid, Malaria, Tuberculosis, COVID-19, Chikungunya, Pneumonia, UTI)
+  with probabilistic symptom profiles, noisy patient responses, and economic
+  pressure from test costs.
+
+author: "Coders Team — Jayti Bhardwaj, Sourav Bhardwaj, Tanishka"
+tags:
+  - openenv
+  - medical
+  - diagnosis
+  - healthcare
+  - reinforcement-learning
+
+entry_point: "server:app"
+server_command: "uvicorn server:app --host 0.0.0.0 --port 7860"
+
+action_space:
+  type: discrete
+  format: string
+  categories:
+    - prefix: "ask_"
+      description: "Ask the patient about a specific symptom"
+      example: "ask_high_fever"
+    - prefix: "test_"
+      description: "Order a diagnostic test (incurs cost, reduces trust)"
+      example: "test_blood_test"
+    - prefix: "diagnose_"
+      description: "Make a final diagnosis — ends the episode"
+      example: "diagnose_dengue"
+
+observation_space:
+  type: dict
+  fields:
+    known_symptoms:
+      type: "dict[str, bool]"
+      description: "Symptoms queried so far and patient responses"
+    test_results:
+      type: "dict[str, bool]"
+      description: "Diagnostic tests ordered and their results"
+    trust_score:
+      type: int
+      range: [0, 100]
+      description: "Patient cooperation level — decreases with each action"
+    steps_remaining:
+      type: int
+      description: "Steps left before forced episode termination"
+    total_cost:
+      type: int
+      description: "Total INR spent on diagnostic tests so far"
+    action_space:
+      type: "list[str]"
+      description: "All valid actions for the current task level"
+    last_action:
+      type: "str | null"
+      description: "Previous action taken"
+    last_reward:
+      type: float
+      description: "Reward received for the last step"
+    message:
+      type: str
+      description: "Human-readable summary of the current state"
+
+reward:
+  type: float
+  description: >
+    Multi-component reward signal. Provides step-wise feedback throughout
+    the episode (not just at termination).
+  components:
+    - name: correct_diagnosis
+      value: +100.0
+      description: "Correct final diagnosis"
+    - name: speed_bonus
+      value: "steps_remaining × 0.5"
+      description: "Bonus for diagnosing quickly"
+    - name: wrong_diagnosis
+      value: -80.0
+      description: "Incorrect final diagnosis"
+    - name: timeout
+      value: -150.0
+      description: "Ran out of steps without diagnosing"
+    - name: test_cost
+      value: "-(cost_inr / 500)"
+      description: "Per-test economic penalty"
+    - name: redundant_action
+      value: -2.0
+      description: "Repeated a symptom question or test"
+    - name: step_penalty
+      value: -0.5
+      description: "Per-step time pressure"
+    - name: low_trust_moderate
+      value: -5.0
+      description: "Trust dropped below 50"
+    - name: low_trust_severe
+      value: -15.0
+      description: "Trust dropped below 20"
+
+tasks:
+  - name: diagnosis_easy
+    id: easy
+    difficulty: easy
+    description: >
+      2 diseases (UTI and Dengue) with clearly distinct symptom profiles.
+      20 steps, 5% symptom noise, slow trust decay.
+      A well-designed agent should achieve >90% accuracy.
+    max_steps: 20
+    noise_level: 0.05
+    diseases: ["uti", "dengue"]
+    success_threshold: 0.7
+    grader: "grader.grade_easy"
+
+  - name: diagnosis_medium
+    id: medium
+    difficulty: medium
+    description: >
+      4 diseases (Dengue, Typhoid, Malaria, Chikungunya) with heavily
+      overlapping symptoms (all share fever, fatigue, headache).
+      15 steps, 10% noise, moderate trust decay.
+      Requires efficient questioning to distinguish diseases.
+    max_steps: 15
+    noise_level: 0.10
+    diseases: ["dengue", "typhoid", "malaria", "chikungunya"]
+    success_threshold: 0.5
+    grader: "grader.grade_medium"
+
+  - name: diagnosis_hard
+    id: hard
+    difficulty: hard
+    description: >
+      All 8 diseases including respiratory conditions (TB, COVID-19, Pneumonia).
+      Only 12 steps, 18% symptom noise, rapid trust decay.
+      Agent must prioritise the most discriminating questions while
+      managing cost and patient cooperation. Genuinely challenges
+      frontier LLMs due to overlapping respiratory + fever symptoms.
+    max_steps: 12
+    noise_level: 0.18
+    diseases: ["dengue", "typhoid", "malaria", "tuberculosis",
+               "covid19", "chikungunya", "pneumonia", "uti"]
+    success_threshold: 0.4
+    grader: "grader.grade_hard"
+
+endpoints:
+  reset:
+    method: POST
+    path: /reset
+    description: "Start a new diagnosis episode"
+  step:
+    method: POST
+    path: /step
+    description: "Take one action in the current episode"
+  state:
+    method: GET
+    path: /state
+    description: "Get current environment state"
+  health:
+    method: GET
+    path: /health
+    description: "Health check endpoint"
