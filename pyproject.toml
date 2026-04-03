@@ -1,0 +1,21 @@
+[project]
+name = "diagnosis-env"
+version = "1.0.0"
+description = "OpenEnv disease diagnosis environment"
+dependencies = [
+  "fastapi",
+  "uvicorn",
+  "pydantic",
+  "openai",
+  "requests",
+  "openenv-core",
+  "PyYAML",
+  "python-dotenv"
+]
+
+[project.scripts]
+server = "server.app:main"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
