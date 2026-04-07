@@ -2,10 +2,9 @@
 
 import os
 from typing import Optional, Dict, Any
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import threading  # <-- NEW
+import threading
 
 # Import your existing modules
 from env import DiagnosisEnv
@@ -48,30 +47,33 @@ _current_task: str = "easy"
 _last_info: Dict[str, Any] = {}
 
 # ---------------------------------------------------------------------------
-# (Your existing helper functions go here...)
-# _get_env, _state_to_observation, _normalise_reward, endpoints, etc.
+# 🔥 START INFERENCE ON STARTUP (CRITICAL FIX)
 # ---------------------------------------------------------------------------
+@app.on_event("startup")
+def startup_event():
+    def run_inference():
+        try:
+            import inference
+            print("🔥 STARTING INFERENCE...", flush=True)
+            inference.main()
+        except Exception as e:
+            print(f"❌ Inference crashed: {e}", flush=True)
+
+    threading.Thread(target=run_inference, daemon=True).start()
 
 # ---------------------------------------------------------------------------
-# RUN INFERENCE IN BACKGROUND
+# BASIC HEALTH CHECK (optional but useful)
 # ---------------------------------------------------------------------------
-def start_inference_thread():
-    """Run inference.py in a separate thread so stdout prints structured logs."""
-    import inference  # your inference.py in the same repo
-    print("RUNNING INFERENCE FILE", flush=True)
-    inference.main()
+@app.get("/")
+def root():
+    return {"message": "DiagnosisEnv API is running"}
 
 # ---------------------------------------------------------------------------
-# MAIN
+# MAIN (NOT USED BY HUGGING FACE BUT OK TO KEEP)
 # ---------------------------------------------------------------------------
 def main():
     import uvicorn
     port = int(os.environ.get("PORT", 7860))
-
-    # Start inference in a background thread
-    threading.Thread(target=start_inference_thread, daemon=True).start()
-
-    # Start FastAPI server
     uvicorn.run("server.app:app", host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
