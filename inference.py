@@ -1,22 +1,25 @@
 """
 inference.py — OpenEnv Baseline Inference Script for DiagnosisEnv
 ==================================================================
-Runs an LLM agent (via OpenAI client) against DiagnosisEnv for all
-three task levels and produces reproducible baseline scores.
+Runs an LLM agent against DiagnosisEnv for all three task levels
+and produces reproducible baseline scores.
 
-Environment variables required:
-  API_BASE_URL  — the LLM API base URL
-  MODEL_NAME    — the model identifier (e.g. "gpt-4o-mini")
-  HF_TOKEN      — your Hugging Face / API key
+IMPORTANT: This script runs the environment DIRECTLY (no server needed).
+The validator runs this file standalone — it does not start a server first.
+
+Uses the Hugging Face Inference API (FREE — no OpenAI key needed).
+
+Environment variables:
+  HF_TOKEN      — your Hugging Face token (starts with hf_)
+  API_BASE_URL  — optional, defaults to HF router
+  MODEL_NAME    — optional, defaults to Qwen2.5-72B-Instruct
 
 Usage:
-  export API_BASE_URL="https://api-inference.huggingface.co/v1"
-  export MODEL_NAME="Qwen/Qwen2.5-72B-Instruct"
   export HF_TOKEN="hf_your_token_here"
   python inference.py
 
 Stdout format (STRICTLY enforced — do not modify):
-  [START] task=<name> env=DiagnosisEnv model=<model>
+  [START] task=<n> env=DiagnosisEnv model=<model>
   [STEP]  step=<n> action=<str> reward=<float> done=<bool> error=<str|None>
   [END]   success=<bool> steps=<n> score=<float> rewards=<list>
 """
@@ -26,37 +29,50 @@ import sys
 import json
 import random
 import statistics
-import time
 from typing import List, Optional
 
-import requests
-from openai import OpenAI
+# ---------------------------------------------------------------------------
+# ADD PROJECT ROOT TO PATH so env/tasks/rewards are importable
+# ---------------------------------------------------------------------------
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from env import DiagnosisEnv
+from tasks import get_task
+from rewards import compute_reward
 
 # ---------------------------------------------------------------------------
-# ENVIRONMENT CONFIG  (read from environment variables — mandatory)
+# ENVIRONMENT CONFIG
 # ---------------------------------------------------------------------------
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME   = os.environ.get("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct")
-API_KEY      = os.environ.get("HF_TOKEN",     "")  # hf_ token is the API key — no OpenAI needed
+API_KEY      = os.environ.get("HF_TOKEN",     "")
 
-SERVER_URL   = os.environ.get("SERVER_URL", "http://localhost:7860")
-
-EPISODES_PER_TASK    = 3       # keep low for speed; set to 10 for full eval
-MAX_STEPS_PER_EPISODE = 25     # hard cap per episode to respect 20-min limit
-SUCCESS_SCORE_THRESHOLD = 0.5  # score >= this → episode success
+EPISODES_PER_TASK     = 3
+MAX_STEPS_PER_EPISODE = 25
+SUCCESS_SCORE_THRESHOLD = 0.5
 
 TASKS = ["easy", "medium", "hard"]
 
-BENCHMARK  = "DiagnosisEnv"
+BENCHMARK = "DiagnosisEnv"
 TASK_NAMES = {
     "easy":   "diagnosis_easy",
     "medium": "diagnosis_medium",
     "hard":   "diagnosis_hard",
 }
 
+# ---------------------------------------------------------------------------
+# REWARD NORMALISATION  (maps raw reward → 0.0–1.0)
+# ---------------------------------------------------------------------------
+MIN_RAW_REWARD = -175.0
+MAX_RAW_REWARD =  115.0
+
+def normalise_reward(raw: float) -> float:
+    clamped = max(MIN_RAW_REWARD, min(MAX_RAW_REWARD, raw))
+    return round((clamped - MIN_RAW_REWARD) / (MAX_RAW_REWARD - MIN_RAW_REWARD), 4)
+
 
 # ---------------------------------------------------------------------------
-# STRICT LOG HELPERS  — DO NOT MODIFY FIELD NAMES OR FORMAT
+# STRICT LOG HELPERS — field names and format must not change
 # ---------------------------------------------------------------------------
 def log_start(task: str, env: str, model: str) -> None:
     print(f"[START] task={task} env={env} model={model}", flush=True)
@@ -81,227 +97,167 @@ def log_end(success: bool, steps: int,
 
 
 # ---------------------------------------------------------------------------
-# SERVER CLIENT HELPERS
+# LLM AGENT  (optional — falls back to heuristic if no token / API fails)
 # ---------------------------------------------------------------------------
-def _post(endpoint: str, payload: dict = None, retries: int = 3) -> dict:
-    """POST to the local DiagnosisEnv server with retry logic."""
-    url = f"{SERVER_URL}{endpoint}"
-    for attempt in range(retries):
-        try:
-            resp = requests.post(url, json=payload or {}, timeout=30)
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as exc:
-            if attempt == retries - 1:
-                raise RuntimeError(f"POST {endpoint} failed after {retries} retries: {exc}")
-            time.sleep(1)
-
-
-def _get(endpoint: str) -> dict:
-    """GET from the local DiagnosisEnv server."""
-    url = f"{SERVER_URL}{endpoint}"
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def reset_env(task: str = "easy", seed: Optional[int] = None) -> dict:
-    payload = {"task": task}
-    if seed is not None:
-        payload["seed"] = seed
-    return _post("/reset", payload)
-
-
-def step_env(action: str, rationale: Optional[str] = None) -> dict:
-    payload = {"action": action}
-    if rationale:
-        payload["rationale"] = rationale
-    return _post("/step", payload)
-
-
-# ---------------------------------------------------------------------------
-# LLM AGENT
-# ---------------------------------------------------------------------------
-
-SYSTEM_PROMPT = """You are an expert physician AI. You are playing a medical diagnosis game.
-
-At each step you receive:
-- A list of symptoms already known (positive and negative)
-- Test results so far
-- Patient trust score (0-100, higher is better)
-- Steps remaining
-- Total cost so far (in INR)
-
-You must choose ONE action from the provided action_space list. Output ONLY the action string, nothing else.
-
-Strategy:
-1. Start by asking about 2-3 distinguishing symptoms
-2. If symptoms point to a disease, order the confirmatory test for that disease
-3. If you have a positive confirmatory test or strong symptom pattern, diagnose
-4. Avoid repeating actions (penalised)
-5. Avoid ordering too many expensive tests (cost penalty)
-6. Make a diagnosis before running out of steps
-
-IMPORTANT: Your response must be EXACTLY one action string from the action_space list."""
-
-
-def build_prompt(obs: dict) -> str:
-    """Build a concise prompt from the current observation."""
-    known = obs.get("known_symptoms", {})
-    tests = obs.get("test_results", {})
-    action_space = obs.get("action_space", [])
-
-    pos_symptoms = [k for k, v in known.items() if v]
-    neg_symptoms = [k for k, v in known.items() if not v]
-    pos_tests    = [k for k, v in tests.items() if v]
-    neg_tests    = [k for k, v in tests.items() if not v]
-
-    lines = [
-        f"Trust: {obs.get('trust_score', 100)}/100  |  "
-        f"Steps left: {obs.get('steps_remaining', 0)}  |  "
-        f"Cost: ₹{obs.get('total_cost', 0)}",
-        "",
-        f"Positive symptoms : {', '.join(pos_symptoms) or 'none'}",
-        f"Negative symptoms : {', '.join(neg_symptoms) or 'none'}",
-        f"Positive tests    : {', '.join(pos_tests) or 'none'}",
-        f"Negative tests    : {', '.join(neg_tests) or 'none'}",
-        "",
-        "Available actions (pick exactly one):",
-    ]
-
-    # Show a condensed subset to avoid hitting context limits
-    ask_actions      = [a for a in action_space if a.startswith("ask_")]
-    test_actions     = [a for a in action_space if a.startswith("test_")]
-    diagnose_actions = [a for a in action_space if a.startswith("diagnose_")]
-
-    # Only show unasked symptoms to keep prompt short
-    unasked_symptoms = [a for a in ask_actions if a[4:] not in known]
-    untested         = [a for a in test_actions if a[5:] not in tests]
-
-    lines.append(f"  Ask symptoms : {unasked_symptoms}")
-    lines.append(f"  Order tests  : {untested}")
-    lines.append(f"  Diagnose     : {diagnose_actions}")
-
-    return "\n".join(lines)
-
-
-def get_llm_action(client: OpenAI, obs: dict,
-                   history: List[str], step: int) -> str:
+def get_llm_action(obs: dict, history: List[str]) -> Optional[str]:
     """
-    Call the LLM to pick the next action.
-    Falls back to a heuristic agent on error to avoid crashing.
+    Try to get an action from the LLM.
+    Returns None if LLM is unavailable — caller falls back to heuristic.
     """
-    action_space = obs.get("action_space", [])
-    if not action_space:
-        return "diagnose_dengue"
-
-    prompt = build_prompt(obs)
-    if history:
-        prompt += f"\n\nRecent history:\n" + "\n".join(history[-5:])
+    if not API_KEY:
+        return None
 
     try:
+        from openai import OpenAI
+        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+
+        action_space = obs.get("action_space", [])
+        known  = obs.get("known_symptoms", {})
+        tests  = obs.get("test_results", {})
+
+        pos_symptoms = [k for k, v in known.items() if v]
+        neg_symptoms = [k for k, v in known.items() if not v]
+        pos_tests    = [k for k, v in tests.items() if v]
+
+        unasked  = [a for a in action_space if a.startswith("ask_")  and a[4:] not in known]
+        untested = [a for a in action_space if a.startswith("test_") and a[5:] not in tests]
+        diagnose = [a for a in action_space if a.startswith("diagnose_")]
+
+        prompt = (
+            f"Trust: {obs.get('trust_score',100)}/100 | "
+            f"Steps left: {obs.get('steps_remaining',0)} | "
+            f"Cost: {obs.get('total_cost',0)} INR\n\n"
+            f"Positive symptoms: {', '.join(pos_symptoms) or 'none'}\n"
+            f"Negative symptoms: {', '.join(neg_symptoms) or 'none'}\n"
+            f"Positive tests: {', '.join(pos_tests) or 'none'}\n\n"
+            f"Ask symptoms: {unasked}\n"
+            f"Order tests: {untested}\n"
+            f"Diagnose: {diagnose}\n\n"
+            f"Recent history: {history[-3:] if history else 'none'}\n\n"
+            f"Output ONLY one action string from the lists above."
+        )
+
+        system = (
+            "You are an expert physician AI playing a medical diagnosis game. "
+            "At each step choose ONE action. Output ONLY the action string, nothing else."
+        )
+
         response = client.chat.completions.create(
             model=MODEL_NAME,
-            max_tokens=50,
+            max_tokens=30,
             temperature=0.1,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system},
                 {"role": "user",   "content": prompt},
             ],
         )
-        raw = response.choices[0].message.content.strip()
-
-        # Validate: must be a real action
+        raw = response.choices[0].message.content.strip().strip("\"'.")
         if raw in action_space:
             return raw
-
-        # Try to find a partial match (LLM sometimes adds spaces/punctuation)
-        raw_clean = raw.strip("\"'.").strip()
-        if raw_clean in action_space:
-            return raw_clean
-
-        # Fallback to heuristic
-        print(f"[DEBUG] LLM returned invalid action '{raw}', using heuristic",
-              flush=True)
-        return _heuristic_fallback(obs, action_space)
+        # partial match
+        for a in action_space:
+            if raw.lower() in a.lower():
+                return a
+        return None
 
     except Exception as exc:
         print(f"[DEBUG] LLM call failed: {exc}", flush=True)
-        return _heuristic_fallback(obs, action_space)
+        return None
 
 
-def _heuristic_fallback(obs: dict, action_space: list) -> str:
-    """Simple heuristic used as fallback when LLM fails."""
+# ---------------------------------------------------------------------------
+# HEURISTIC FALLBACK AGENT
+# ---------------------------------------------------------------------------
+def heuristic_action(obs: dict) -> str:
+    """Rule-based agent used when LLM is unavailable or returns invalid action."""
+    action_space = obs.get("action_space", [])
     known    = obs.get("known_symptoms", {})
-    tests    = obs.get("test_results", {})
+    tests    = obs.get("test_results",   {})
     positive = [s for s, v in known.items() if v]
 
-    ask_actions      = [a for a in action_space if a.startswith("ask_")
-                        and a[4:] not in known]
-    test_actions     = [a for a in action_space if a.startswith("test_")]
-    diagnose_actions = [a for a in action_space if a.startswith("diagnose_")]
-    untested         = [a for a in test_actions if a[5:] not in tests]
+    ask_actions  = [a for a in action_space if a.startswith("ask_")  and a[4:] not in known]
+    test_actions = [a for a in action_space if a.startswith("test_")]
+    diag_actions = [a for a in action_space if a.startswith("diagnose_")]
+    untested     = [a for a in test_actions  if a[5:] not in tests]
 
     if len(known) < 3 and ask_actions:
         return random.choice(ask_actions)
     if positive and not tests and untested:
         return random.choice(untested)
-    if any(v for v in tests.values()) and diagnose_actions:
-        return random.choice(diagnose_actions)
+    if any(v for v in tests.values()) and diag_actions:
+        return random.choice(diag_actions)
     if ask_actions:
         return random.choice(ask_actions)
-    if diagnose_actions:
-        return random.choice(diagnose_actions)
+    if diag_actions:
+        return random.choice(diag_actions)
     return random.choice(action_space)
 
 
-# ---------------------------------------------------------------------------
-# RUN ONE EPISODE
-# ---------------------------------------------------------------------------
-def run_episode(client: OpenAI, task: str, episode_num: int,
-                seed: Optional[int] = None) -> dict:
-    """
-    Run one full episode for a given task level.
+def pick_action(obs: dict, history: List[str]) -> str:
+    """Try LLM first, fall back to heuristic."""
+    action = get_llm_action(obs, history)
+    if action is None:
+        action = heuristic_action(obs)
+    return action
 
-    Returns:
-        dict with score (0.0–1.0), steps, rewards, success
-    """
-    task_name = TASK_NAMES[task]
+
+# ---------------------------------------------------------------------------
+# OBSERVATION BUILDER  (converts raw env state → obs dict inference.py uses)
+# ---------------------------------------------------------------------------
+def build_obs(state: dict, env: DiagnosisEnv,
+              last_action: Optional[str] = None,
+              last_reward: float = 0.0) -> dict:
+    return {
+        "known_symptoms":  state.get("known_symptoms", {}),
+        "test_results":    state.get("test_results", {}),
+        "trust_score":     state.get("trust_score", 100),
+        "steps_remaining": state.get("steps_remaining", 0),
+        "total_cost":      state.get("total_cost", 0),
+        "action_space":    env.action_space,
+        "last_action":     last_action,
+        "last_reward":     last_reward,
+    }
+
+
+# ---------------------------------------------------------------------------
+# RUN ONE EPISODE  (directly against the Python env — no server needed)
+# ---------------------------------------------------------------------------
+def run_episode(task_level: str, episode_num: int,
+                seed: Optional[int] = None) -> dict:
+    """Run one full episode and emit [START] / [STEP] / [END] logs."""
+
+    task_name = TASK_NAMES[task_level]
     log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
 
-    # Reset environment
-    reset_data = reset_env(task=task, seed=seed)
-    obs        = reset_data.get("observation", {})
+    env   = get_task(task_level)
+    state = env.reset(seed=seed)
+    obs   = build_obs(state, env)
 
-    history:  List[str]   = []
-    rewards:  List[float] = []
+    history:    List[str]   = []
+    rewards:    List[float] = []
     steps_taken = 0
     score       = 0.0
     success     = False
-    done        = False
+    error_msg   = None
 
     try:
         for step_num in range(1, MAX_STEPS_PER_EPISODE + 1):
-            if done:
+            if env.done:
                 break
 
-            action = get_llm_action(client, obs, history, step_num)
+            action    = pick_action(obs, history)
+            error_msg = None
 
             try:
-                step_data   = step_env(action)
-                obs         = step_data.get("observation", {})
-                reward_info = step_data.get("reward", {})
-                raw_reward  = reward_info.get("value", 0.0)
-                norm_reward = reward_info.get("normalised", 0.0)
-                done        = step_data.get("done", False)
-                info        = step_data.get("info", {})
-                error       = None
+                next_state, raw_reward, done, info = env.step(action)
+                norm_reward = normalise_reward(raw_reward)
+                obs         = build_obs(next_state, env,
+                                        last_action=action,
+                                        last_reward=raw_reward)
             except Exception as exc:
-                raw_reward  = 0.0
                 norm_reward = 0.0
                 done        = True
-                error       = str(exc)
-                info        = {}
+                error_msg   = str(exc)
 
             rewards.append(norm_reward)
             steps_taken = step_num
@@ -310,18 +266,15 @@ def run_episode(client: OpenAI, task: str, episode_num: int,
                 step=step_num,
                 action=action,
                 reward=round(norm_reward, 4),
-                done=done,
-                error=error,
+                done=env.done,
+                error=error_msg,
             )
 
-            history.append(
-                f"Step {step_num}: {action!r} → reward {raw_reward:+.2f}"
-            )
+            history.append(f"Step {step_num}: {action!r} → reward {raw_reward:+.2f}")
 
-            if done:
+            if env.done:
                 break
 
-        # Episode score = mean of normalised per-step rewards
         score   = round(statistics.mean(rewards), 4) if rewards else 0.0
         score   = min(max(score, 0.0), 1.0)
         success = score >= SUCCESS_SCORE_THRESHOLD
@@ -336,7 +289,7 @@ def run_episode(client: OpenAI, task: str, episode_num: int,
                 score=score, rewards=rewards)
 
     return {
-        "task":    task,
+        "task":    task_level,
         "episode": episode_num,
         "score":   score,
         "steps":   steps_taken,
@@ -349,47 +302,23 @@ def run_episode(client: OpenAI, task: str, episode_num: int,
 # MAIN
 # ---------------------------------------------------------------------------
 def main():
-    # Validate environment variables
+    # Warn if no token, but DON'T exit — heuristic agent works without it
     if not API_KEY:
-        print("[ERROR] HF_TOKEN environment variable is not set.", flush=True)
-        sys.exit(1)
+        print("[DEBUG] HF_TOKEN not set — using heuristic agent (no LLM calls)", flush=True)
 
-    print(f"\n{'='*60}", flush=True)
-    print(f"  DiagnosisEnv — Baseline Inference Script", flush=True)
-    print(f"  Model      : {MODEL_NAME}", flush=True)
-    print(f"  API Base   : {API_BASE_URL}", flush=True)
-    print(f"  Server     : {SERVER_URL}", flush=True)
-    print(f"  Episodes   : {EPISODES_PER_TASK} per task × 3 tasks", flush=True)
-    print(f"{'='*60}\n", flush=True)
+    print(f"[DEBUG] Model: {MODEL_NAME}", flush=True)
+    print(f"[DEBUG] Episodes: {EPISODES_PER_TASK} per task x 3 tasks", flush=True)
 
-    # Check server is alive
-    try:
-        health = _get("/health")
-        print(f"  ✅ Server healthy: {health}", flush=True)
-    except Exception as exc:
-        print(f"  ❌ Cannot reach server at {SERVER_URL}: {exc}", flush=True)
-        print(f"     Start it with: uvicorn server:app --host 0.0.0.0 --port 7860",
-              flush=True)
-        sys.exit(1)
-
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-
-    all_results = {}
+    all_results    = {}
     overall_scores = []
 
     for task in TASKS:
-        print(f"\n{'─'*60}", flush=True)
-        print(f"  TASK: {task.upper()}", flush=True)
-        print(f"{'─'*60}", flush=True)
-
         task_scores  = []
         task_results = []
 
         for ep in range(EPISODES_PER_TASK):
-            seed = 42 + ep
-            print(f"\n  Episode {ep + 1}/{EPISODES_PER_TASK} (seed={seed})",
-                  flush=True)
-            result = run_episode(client, task, ep + 1, seed=seed)
+            seed   = 42 + ep
+            result = run_episode(task, ep + 1, seed=seed)
             task_scores.append(result["score"])
             task_results.append(result)
 
@@ -401,21 +330,7 @@ def main():
         }
         overall_scores.append(avg_score)
 
-        print(f"\n  ★ {task.upper()} avg score: {avg_score:.4f} / 1.0", flush=True)
-
-    # Final summary
     overall_avg = round(statistics.mean(overall_scores), 4)
-
-    print(f"\n{'='*60}", flush=True)
-    print(f"  FINAL BASELINE RESULTS", flush=True)
-    print(f"{'='*60}", flush=True)
-    for task in TASKS:
-        s = all_results[task]["avg_score"]
-        print(f"  {task.upper():<8} : {s:.4f} / 1.0  ({s*100:.1f}%)", flush=True)
-    print(f"  {'─'*40}", flush=True)
-    print(f"  OVERALL  : {overall_avg:.4f} / 1.0  ({overall_avg*100:.1f}%)",
-          flush=True)
-    print(f"{'='*60}\n", flush=True)
 
     # Machine-readable summary
     summary = {
